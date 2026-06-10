@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::adapter::{filter_narration, Adapter};
 use crate::protobuf::{
     extract_text_from_step_payload, extract_title_from_step_payload, extract_tool_name,
-    extract_tool_update_from_step_payload, extract_user_text_from_step_payload, read_varint,
+    extract_tool_update_from_step_payload, extract_user_text_from_step_payload, is_tool_step_type,
+    read_varint,
 };
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -200,6 +201,23 @@ fn test_extract_tool_update_from_bash_tool() {
     assert_eq!(update["title"], "Run cargo test");
     assert_eq!(update["kind"], "execute");
     assert_eq!(update["rawInput"]["CommandLine"], "cargo test");
+}
+
+#[test]
+fn test_extract_tool_update_from_web_search_step() {
+    let payload = br#"
+        search_web
+        {"query":"FIFA World Cup 2026 dates","toolAction":"Searching World Cup dates","toolSummary":"Search FIFA World Cup 2026 dates"}
+    "#;
+
+    assert!(is_tool_step_type(33));
+    let update = extract_tool_update_from_step_payload(3, 33, payload).unwrap();
+    assert_eq!(update["sessionUpdate"], "tool_call");
+    assert_eq!(update["toolCallId"], "agy-3-33");
+    assert_eq!(update["title"], "Search FIFA World Cup 2026 dates");
+    assert_eq!(update["kind"], "search");
+    assert_eq!(update["status"], "completed");
+    assert_eq!(update["rawInput"]["query"], "FIFA World Cup 2026 dates");
 }
 
 #[test]

@@ -181,7 +181,7 @@ pub fn tool_kind(tool_name: &str) -> &'static str {
 }
 
 pub fn is_tool_step_type(step_type: i64) -> bool {
-    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 101 | 138)
+    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 138)
 }
 
 pub fn tool_content(input: &Value) -> Option<Value> {
