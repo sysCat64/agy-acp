@@ -5,7 +5,12 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -59,10 +64,20 @@ struct Session {
     model_id: Option<String>,
 }
 
+#[cfg(test)]
 struct ConversationDelta {
     text: Option<String>,
-    tool_updates: Vec<Value>,
     max_step_idx: i64,
+}
+
+#[derive(Debug, Default)]
+struct StreamingState {
+    conversation_id: Option<String>,
+    base_step_idx: i64,
+    last_step_idx: i64,
+    had_updates: bool,
+    agent_text_lengths: HashMap<i64, usize>,
+    emitted_tool_steps: HashSet<i64>,
 }
 
 struct Adapter {
@@ -215,8 +230,41 @@ impl Adapter {
             .collect()
     }
 
+    #[cfg(test)]
     fn new_conversation_id(&self, before: &HashSet<String>) -> Option<String> {
         let after = self.conversation_snapshot();
+        let mut created: Vec<_> = after.difference(before).collect();
+        if created.is_empty() {
+            return None;
+        }
+        if created.len() > 1 {
+            eprintln!(
+                "[agy-acp] WARN: multiple new agy conversation files appeared; \
+                 refusing to bind"
+            );
+            return None;
+        }
+        Some(created.remove(0).clone())
+    }
+
+    fn new_conversation_id_in_dir(
+        conversations_dir: &Path,
+        before: &HashSet<String>,
+    ) -> Option<String> {
+        let Ok(entries) = fs::read_dir(conversations_dir) else {
+            return None;
+        };
+        let after: HashSet<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().map(|x| x == "db").unwrap_or(false) {
+                    path.file_stem().map(|s| s.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut created: Vec<_> = after.difference(before).collect();
         if created.is_empty() {
             return None;
@@ -343,7 +391,7 @@ impl Adapter {
         if parts.is_empty() {
             return;
         }
-        let text = Self::filter_narration(parts);
+        let text = parts.join("\n");
         parts.clear();
         if !text.is_empty() {
             updates.push(Self::message_chunk_update("agent_message_chunk", text));
@@ -522,9 +570,15 @@ impl Adapter {
         conversation_id: &str,
         after_step_idx: i64,
     ) -> Option<Vec<(i64, i64, Vec<u8>)>> {
-        let db_path = self
-            .conversations_dir
-            .join(format!("{}.db", conversation_id));
+        Self::read_rows_from_db_dir(&self.conversations_dir, conversation_id, after_step_idx)
+    }
+
+    fn read_rows_from_db_dir(
+        conversations_dir: &Path,
+        conversation_id: &str,
+        after_step_idx: i64,
+    ) -> Option<Vec<(i64, i64, Vec<u8>)>> {
+        let db_path = conversations_dir.join(format!("{}.db", conversation_id));
         let conn = Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -579,6 +633,7 @@ impl Adapter {
                     }
                 }
             } else if matches!(*step_type, 7 | 8 | 9 | 17 | 101 | 138) {
+                Self::flush_agent_message(&mut pending_agent_parts, &mut updates);
                 if let Some(update) =
                     Self::extract_tool_update_from_step_payload(*idx, *step_type, payload)
                 {
@@ -594,16 +649,25 @@ impl Adapter {
         Some((updates, max_idx))
     }
 
+    #[cfg(test)]
     fn read_delta_from_db(
         &self,
         conversation_id: &str,
         after_step_idx: i64,
     ) -> Option<ConversationDelta> {
-        let rows = self.read_rows_from_db(conversation_id, after_step_idx)?;
+        Self::read_delta_from_db_dir(&self.conversations_dir, conversation_id, after_step_idx)
+    }
+
+    #[cfg(test)]
+    fn read_delta_from_db_dir(
+        conversations_dir: &Path,
+        conversation_id: &str,
+        after_step_idx: i64,
+    ) -> Option<ConversationDelta> {
+        let rows = Self::read_rows_from_db_dir(conversations_dir, conversation_id, after_step_idx)?;
 
         let mut max_idx = after_step_idx;
         let mut response_parts: Vec<String> = Vec::new();
-        let mut tool_updates = Vec::new();
         for (idx, step_type, payload) in &rows {
             max_idx = max_idx.max(*idx);
             if *step_type == 15 {
@@ -612,15 +676,9 @@ impl Adapter {
                         response_parts.push(text);
                     }
                 }
-            } else if matches!(*step_type, 7 | 8 | 9 | 17 | 101 | 138) {
-                if let Some(update) =
-                    Self::extract_tool_update_from_step_payload(*idx, *step_type, payload)
-                {
-                    tool_updates.push(update);
-                }
             }
         }
-        if response_parts.is_empty() && tool_updates.is_empty() {
+        if response_parts.is_empty() {
             let response_rows: Vec<_> = rows
                 .iter()
                 .filter(|(_, step_type, _)| *step_type == 15)
@@ -643,9 +701,95 @@ impl Adapter {
         };
         Some(ConversationDelta {
             text,
-            tool_updates,
             max_step_idx: max_idx,
         })
+    }
+
+    fn poll_streaming_delta(
+        conversations_dir: &Path,
+        snapshot: Option<&HashSet<String>>,
+        session_id: &str,
+        state: &Arc<Mutex<StreamingState>>,
+    ) -> Vec<String> {
+        let (conversation_id, base_step_idx) = {
+            let mut guard = state.lock().unwrap();
+            if guard.conversation_id.is_none() {
+                if let Some(before) = snapshot {
+                    guard.conversation_id =
+                        Self::new_conversation_id_in_dir(conversations_dir, before);
+                }
+            }
+            (guard.conversation_id.clone(), guard.base_step_idx)
+        };
+
+        let Some(conversation_id) = conversation_id else {
+            return Vec::new();
+        };
+
+        let Some(rows) =
+            Self::read_rows_from_db_dir(conversations_dir, &conversation_id, base_step_idx)
+        else {
+            return Vec::new();
+        };
+
+        let mut guard = state.lock().unwrap();
+        let mut notifications = Vec::new();
+
+        for (idx, step_type, payload) in rows {
+            guard.last_step_idx = guard.last_step_idx.max(idx);
+
+            if step_type == 15 {
+                let Some(text) = Self::extract_text_from_step_payload(&payload) else {
+                    continue;
+                };
+                let written_len = guard.agent_text_lengths.get(&idx).copied().unwrap_or(0);
+                if text.len() <= written_len {
+                    continue;
+                }
+                let Some(new_text) = text.get(written_len..) else {
+                    continue;
+                };
+                guard.agent_text_lengths.insert(idx, text.len());
+                if !new_text.is_empty() {
+                    notifications.push(
+                        serde_json::to_string(&JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".to_string(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": new_text },
+                                },
+                            }),
+                        })
+                        .unwrap(),
+                    );
+                }
+            } else if matches!(step_type, 7 | 8 | 9 | 17 | 101 | 138)
+                && !guard.emitted_tool_steps.contains(&idx)
+            {
+                if let Some(update) =
+                    Self::extract_tool_update_from_step_payload(idx, step_type, &payload)
+                {
+                    guard.emitted_tool_steps.insert(idx);
+                    notifications.push(
+                        serde_json::to_string(&JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".to_string(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": update,
+                            }),
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+
+        guard.had_updates = guard.had_updates || !notifications.is_empty();
+        notifications
     }
 
     #[cfg(test)]
@@ -662,6 +806,7 @@ impl Adapter {
     /// the OPENAB_TOOL_DISPLAY environment variable.
     /// - "full": return all parts joined
     /// - "compact" / "none" / unset: drop leading narration-only parts
+    #[cfg(test)]
     fn filter_narration(parts: &[String]) -> String {
         let should_filter = std::env::var("OPENAB_TOOL_DISPLAY")
             .map(|v| {
@@ -673,6 +818,7 @@ impl Adapter {
         Self::filter_narration_with_mode(parts, should_filter)
     }
 
+    #[cfg(test)]
     fn filter_narration_with_mode(parts: &[String], should_filter: bool) -> String {
         if !should_filter || parts.len() <= 1 {
             return parts.join("\n");
@@ -687,6 +833,7 @@ impl Adapter {
     }
 
     /// A part is considered narration if every non-empty line starts with "I will".
+    #[cfg(test)]
     fn is_narration(text: &str) -> bool {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.is_empty() {
@@ -993,16 +1140,127 @@ impl Adapter {
         args.push("-p".to_string());
         args.push(clean_prompt.to_string());
 
-        let result = Command::new("agy")
+        let spawn_result = Command::new("agy")
             .args(&args)
             .current_dir(&self.working_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()
-            .await;
+            .spawn();
 
-        let mut output_lines = Vec::new();
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(e) => {
+                return vec![serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({"code":-32000,"message":format!("failed to run agy: {e}")})),
+                })
+                .unwrap()];
+            }
+        };
+
+        let initial_conv_id = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.conversation_id.clone());
+        let initial_step_idx = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.last_step_idx)
+            .unwrap_or(-1);
+        let streaming_state = Arc::new(Mutex::new(StreamingState {
+            conversation_id: initial_conv_id,
+            base_step_idx: initial_step_idx,
+            last_step_idx: initial_step_idx,
+            had_updates: false,
+            agent_text_lengths: HashMap::new(),
+            emitted_tool_steps: HashSet::new(),
+        }));
+        let stop_polling = Arc::new(AtomicBool::new(false));
+        let poll_conversations_dir = self.conversations_dir.clone();
+        let poll_snapshot = snapshot.clone();
+        let poll_session_id = session_id.to_string();
+        let poll_state = Arc::clone(&streaming_state);
+        let poll_stop = Arc::clone(&stop_polling);
+
+        let poller = std::thread::spawn(move || {
+            let mut stdout = io::stdout();
+            while !poll_stop.load(Ordering::SeqCst) {
+                for line in Self::poll_streaming_delta(
+                    &poll_conversations_dir,
+                    poll_snapshot.as_ref(),
+                    &poll_session_id,
+                    &poll_state,
+                ) {
+                    let _ = writeln!(stdout, "{}", line);
+                }
+                let _ = stdout.flush();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let result = child.wait_with_output().await;
+        stop_polling.store(true, Ordering::SeqCst);
+        let _ = poller.join();
+
+        let mut final_lines = Vec::new();
+        for attempt in 0..3 {
+            let lines = Self::poll_streaming_delta(
+                &self.conversations_dir,
+                snapshot.as_ref(),
+                session_id,
+                &streaming_state,
+            );
+            final_lines.extend(lines);
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        {
+            let mut stdout = io::stdout();
+            for line in &final_lines {
+                let _ = writeln!(stdout, "{}", line);
+            }
+            let _ = stdout.flush();
+        }
+
+        let state = streaming_state.lock().unwrap();
+        let bound_conv_id = state.conversation_id.clone();
+        let new_step_idx = state.last_step_idx;
+        let had_updates = state.had_updates || !final_lines.is_empty();
+        drop(state);
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if session.conversation_id.is_none() {
+                session.conversation_id = bound_conv_id.clone();
+            }
+            if bound_conv_id.is_some() {
+                session.last_step_idx = new_step_idx;
+            }
+        }
+        if bound_conv_id.is_some() {
+            let model_id = self
+                .sessions
+                .get(session_id)
+                .and_then(|s| s.model_id.clone());
+            self.persist_session(
+                session_id,
+                bound_conv_id.as_deref(),
+                new_step_idx,
+                model_id.as_deref(),
+            );
+        }
+
+        let output_lines = vec![serde_json::to_string(&JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: id.clone(),
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+        })
+        .unwrap()];
 
         match result {
             Ok(output) => {
@@ -1013,158 +1271,35 @@ impl Adapter {
 
                 if !output.status.success() {
                     eprintln!("[agy-acp] WARN: agy exited with status: {}", output.status);
-                    if output.stdout.is_empty() {
+                    if !had_updates {
                         let msg = if stderr_text.is_empty() {
                             format!("agy exited with status: {}", output.status)
                         } else {
                             format!("agy failed: {}", stderr_text.trim_end())
                         };
-                        let resp = JsonRpcResponse {
+                        return vec![serde_json::to_string(&JsonRpcResponse {
                             jsonrpc: "2.0",
                             id,
                             result: None,
                             error: Some(json!({"code":-32000,"message":msg})),
-                        };
-                        output_lines.push(serde_json::to_string(&resp).unwrap());
-                        return output_lines;
-                    }
-                }
-
-                let full_text = String::from_utf8_lossy(&output.stdout).to_string();
-
-                // Bind conversation from snapshot diff
-                let conv_id = snapshot
-                    .as_ref()
-                    .and_then(|before| self.new_conversation_id(before));
-
-                if let Some(session) = self.sessions.get_mut(session_id) {
-                    if session.conversation_id.is_none() {
-                        session.conversation_id = conv_id.clone();
-                    }
-                }
-
-                let bound_conv_id = self
-                    .sessions
-                    .get(session_id)
-                    .and_then(|s| s.conversation_id.clone());
-                let last_step_idx = self
-                    .sessions
-                    .get(session_id)
-                    .map(|s| s.last_step_idx)
-                    .unwrap_or(-1);
-
-                // Read response delta from SQLite
-                let (new_text, tool_updates, new_step_idx) = if let Some(cid) = &bound_conv_id {
-                    match self.read_delta_from_db(cid, last_step_idx) {
-                        Some(delta) => {
-                            eprintln!(
-                                "[agy-acp] delta from SQLite (steps {} → {})",
-                                last_step_idx, delta.max_step_idx
-                            );
-                            (delta.text, delta.tool_updates, delta.max_step_idx)
-                        }
-                        None => {
-                            eprintln!(
-                                "[agy-acp] WARN: SQLite read returned no new text or tool updates"
-                            );
-                            (None, Vec::new(), last_step_idx)
-                        }
-                    }
-                } else {
-                    eprintln!("[agy-acp] WARN: could not bind conversation ID; single-turn mode");
-                    let parts: Vec<String> = full_text.split("\n\n").map(String::from).collect();
-                    let filtered = Self::filter_narration(&parts);
-                    (Some(filtered), Vec::new(), -1i64)
-                };
-
-                // Persist session state
-                if let Some(session) = self.sessions.get_mut(session_id) {
-                    if session.conversation_id.is_some() {
-                        session.last_step_idx = new_step_idx;
-                    }
-                }
-                if bound_conv_id.is_some() {
-                    let model_id = self
-                        .sessions
-                        .get(session_id)
-                        .and_then(|s| s.model_id.clone());
-                    self.persist_session(
-                        session_id,
-                        bound_conv_id.as_deref(),
-                        new_step_idx,
-                        model_id.as_deref(),
-                    );
-                }
-
-                let had_tool_updates = !tool_updates.is_empty();
-                for update in tool_updates {
-                    let notification = serde_json::to_string(&JsonRpcNotification {
-                        jsonrpc: "2.0",
-                        method: "session/update".to_string(),
-                        params: json!({
-                            "sessionId": session_id,
-                            "update": update,
-                        }),
-                    })
-                    .unwrap();
-                    output_lines.push(notification);
-                }
-
-                match new_text {
-                    Some(text) => {
-                        let notification = serde_json::to_string(&JsonRpcNotification {
-                            jsonrpc: "2.0",
-                            method: "session/update".to_string(),
-                            params: json!({
-                                "sessionId": session_id,
-                                "update": {
-                                    "sessionUpdate": "agent_message_chunk",
-                                    "content": { "type": "text", "text": text },
-                                },
-                            }),
                         })
-                        .unwrap();
-                        output_lines.push(notification);
-                        let resp = JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            result: Some(json!({ "stopReason": "end_turn" })),
-                            error: None,
-                        };
-                        output_lines.push(serde_json::to_string(&resp).unwrap());
-                    }
-                    None => {
-                        let resp = if had_tool_updates {
-                            JsonRpcResponse {
-                                jsonrpc: "2.0",
-                                id,
-                                result: Some(json!({ "stopReason": "end_turn" })),
-                                error: None,
-                            }
-                        } else {
-                            JsonRpcResponse {
-                                jsonrpc: "2.0",
-                                id,
-                                result: None,
-                                error: Some(
-                                    json!({"code":-32001,"message":"agy responded but response extraction failed — possible schema change in conversation DB (field 20.1)"}),
-                                ),
-                            }
-                        };
-                        output_lines.push(serde_json::to_string(&resp).unwrap());
+                        .unwrap()];
                     }
                 }
             }
             Err(e) => {
-                let resp = JsonRpcResponse {
+                return vec![serde_json::to_string(&JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
                     result: None,
-                    error: Some(json!({"code":-32000,"message":format!("failed to run agy: {e}")})),
-                };
-                output_lines.push(serde_json::to_string(&resp).unwrap());
+                    error: Some(
+                        json!({"code":-32000,"message":format!("failed to wait for agy: {e}")}),
+                    ),
+                })
+                .unwrap()];
             }
         }
+
         output_lines
     }
 }
@@ -1625,6 +1760,25 @@ mod tests {
                 && notification["params"]["update"]["title"] == "View README file"
                 && notification["params"]["update"]["kind"] == "read"
         }));
+        let replay_kinds: Vec<_> = updates
+            .iter()
+            .map(|notification| {
+                notification["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            replay_kinds,
+            vec![
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "agent_message_chunk",
+                "user_message_chunk",
+                "agent_message_chunk"
+            ]
+        );
         let message_updates: Vec<_> = updates
             .iter()
             .filter(|notification| {
@@ -1647,6 +1801,7 @@ mod tests {
             vec![
                 "user_message_chunk",
                 "agent_message_chunk",
+                "agent_message_chunk",
                 "user_message_chunk",
                 "agent_message_chunk"
             ]
@@ -1663,14 +1818,15 @@ mod tests {
             message_texts,
             vec![
                 "hello",
+                "I will inspect the workspace.",
                 "hello from agent",
                 "how are you?",
                 "second response"
             ]
         );
         assert!(
-            !message_texts[1].contains("I will inspect"),
-            "load replay should not merge narration into the final assistant message"
+            message_texts[1].contains("I will inspect"),
+            "load replay should preserve narration shown in the live session"
         );
 
         // Last line should be the success response
