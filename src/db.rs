@@ -5,7 +5,8 @@ use std::path::Path;
 
 use crate::protobuf::{
     extract_text_from_step_payload, extract_tool_update_from_step_payload,
-    extract_user_text_from_step_payload, flush_agent_message, message_chunk_update,
+    extract_user_text_from_step_payload, flush_agent_message, is_tool_step_type,
+    message_chunk_update,
 };
 
 #[cfg(test)]
@@ -105,7 +106,7 @@ pub fn read_replay_updates_from_db(
                     pending_agent_parts.push(text);
                 }
             }
-        } else if matches!(*step_type, 7 | 8 | 9 | 17 | 101 | 138) {
+        } else if is_tool_step_type(*step_type) {
             flush_agent_message(&mut pending_agent_parts, &mut updates);
             if let Some(update) = extract_tool_update_from_step_payload(*idx, *step_type, payload) {
                 updates.push(update);

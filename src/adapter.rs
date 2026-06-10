@@ -192,6 +192,8 @@ impl Adapter {
         }
     }
 
+    /// Scans the conversations directory for SQLite database files (`*.db`)
+    /// and returns their file stems as a set of conversation IDs.
     pub fn conversation_snapshot(&self) -> HashSet<String> {
         let Ok(entries) = fs::read_dir(&self.conversations_dir) else {
             return HashSet::new();
@@ -252,18 +254,10 @@ impl Adapter {
             .and_then(|delta| delta.text.map(|text| (text, delta.max_step_idx)))
     }
 
-    /// Filter out leading narration ("I will ...") from response parts based on
-    /// the OPENAB_TOOL_DISPLAY environment variable.
+    /// Filter out leading narration ("I will ...") from response parts.
     #[cfg(test)]
     pub fn filter_narration(parts: &[String]) -> String {
-        let should_filter = std::env::var("OPENAB_TOOL_DISPLAY")
-            .map(|v| {
-                let lower = v.to_lowercase();
-                lower != "full"
-            })
-            .unwrap_or(true);
-
-        filter_narration_with_mode(parts, should_filter)
+        filter_narration(parts)
     }
 
     /// A part is considered narration if every non-empty line starts with "I will".
@@ -809,23 +803,9 @@ impl Adapter {
 }
 
 /// Filter out leading narration ("I will ...") from response parts.
-/// - "full": return all parts joined
-/// - "compact" / "none" / unset: drop leading narration-only parts
 #[cfg(test)]
 pub fn filter_narration(parts: &[String]) -> String {
-    let should_filter = std::env::var("OPENAB_TOOL_DISPLAY")
-        .map(|v| {
-            let lower = v.to_lowercase();
-            lower != "full"
-        })
-        .unwrap_or(true);
-
-    filter_narration_with_mode(parts, should_filter)
-}
-
-#[cfg(test)]
-pub fn filter_narration_with_mode(parts: &[String], should_filter: bool) -> String {
-    if !should_filter || parts.len() <= 1 {
+    if parts.len() <= 1 {
         return parts.join("\n");
     }
 

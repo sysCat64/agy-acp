@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::adapter::{filter_narration_with_mode, Adapter};
+use crate::adapter::{filter_narration, Adapter};
 use crate::protobuf::{
     extract_text_from_step_payload, extract_tool_name, extract_tool_update_from_step_payload,
     extract_user_text_from_step_payload, read_varint,
@@ -145,6 +145,32 @@ fn test_extract_tool_name_from_embedded_token() {
         extract_tool_name("abc123\tview_file\n{...}"),
         Some("view_file".to_string())
     );
+}
+
+#[test]
+fn test_extract_tool_update_from_pascal_case_edit_tool() {
+    let payload = br#"
+        Edit
+        {"file_path":"/tmp/project/src/main.rs","old_string":"old","new_string":"new"}
+    "#;
+
+    let update = extract_tool_update_from_step_payload(9, 4, payload).unwrap();
+    assert_eq!(update["title"], "Edit");
+    assert_eq!(update["kind"], "edit");
+    assert_eq!(update["rawInput"]["file_path"], "/tmp/project/src/main.rs");
+}
+
+#[test]
+fn test_extract_tool_update_from_bash_tool() {
+    let payload = br#"
+        run_command
+        {"CommandLine":"cargo test","Cwd":"/tmp/project","toolAction":"Running tests","toolSummary":"Run cargo test"}
+    "#;
+
+    let update = extract_tool_update_from_step_payload(10, 21, payload).unwrap();
+    assert_eq!(update["title"], "Run cargo test");
+    assert_eq!(update["kind"], "execute");
+    assert_eq!(update["rawInput"]["CommandLine"], "cargo test");
 }
 
 #[test]
@@ -315,18 +341,38 @@ fn test_session_load_replays_conversation_history() {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 5, ?2)",
+        rusqlite::params![
+            4i64,
+            br#"replace_file_content
+            {"AbsolutePath":"/tmp/project/README.md","toolAction":"Editing README.md","toolSummary":"Edit README file"}"#
+                .as_slice()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 21, ?2)",
+        rusqlite::params![
+            5i64,
+            br#"run_command
+            {"CommandLine":"cargo test","Cwd":"/tmp/project","toolAction":"Running tests","toolSummary":"Run cargo test"}"#
+                .as_slice()
+        ],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
-        rusqlite::params![4i64, make_assistant_payload("hello from agent")],
+        rusqlite::params![6i64, make_assistant_payload("hello from agent")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
-        rusqlite::params![5i64, make_user_payload("how are you?")],
+        rusqlite::params![7i64, make_user_payload("how are you?")],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
-        rusqlite::params![6i64, make_assistant_payload("second response")],
+        rusqlite::params![8i64, make_assistant_payload("second response")],
     )
     .unwrap();
     drop(conn);
@@ -338,7 +384,7 @@ fn test_session_load_replays_conversation_history() {
         state_file: root.join("sessions.json"),
         available_models: vec![],
     };
-    adapter.persist_session("sess-replay", Some("conv-replay"), 6, None);
+    adapter.persist_session("sess-replay", Some("conv-replay"), 8, None);
 
     let output = adapter.handle_session_load(json!(1), &json!({"sessionId": "sess-replay"}));
 
@@ -358,6 +404,14 @@ fn test_session_load_replays_conversation_history() {
             && notification["params"]["update"]["title"] == "View README file"
             && notification["params"]["update"]["kind"] == "read"
     }));
+    assert!(updates.iter().any(|notification| {
+        notification["params"]["update"]["title"] == "Edit README file"
+            && notification["params"]["update"]["kind"] == "edit"
+    }));
+    assert!(updates.iter().any(|notification| {
+        notification["params"]["update"]["title"] == "Run cargo test"
+            && notification["params"]["update"]["kind"] == "execute"
+    }));
     let replay_kinds: Vec<_> = updates
         .iter()
         .map(|notification| {
@@ -371,6 +425,8 @@ fn test_session_load_replays_conversation_history() {
         vec![
             "user_message_chunk",
             "agent_message_chunk",
+            "tool_call",
+            "tool_call",
             "tool_call",
             "agent_message_chunk",
             "user_message_chunk",
@@ -1255,7 +1311,7 @@ fn test_filter_narration_drops_leading_narration() {
         "I will read the file.".to_string(),
         "The fix is confirmed! LGTM ✅".to_string(),
     ];
-    let result = filter_narration_with_mode(&parts, true);
+    let result = filter_narration(&parts);
     assert_eq!(result, "The fix is confirmed! LGTM ✅");
 }
 
@@ -1266,31 +1322,11 @@ fn test_filter_narration_preserves_content_after_first_non_narration() {
         "Here is my analysis.".to_string(),
         "I will also note this is fine.".to_string(),
     ];
-    let result = filter_narration_with_mode(&parts, true);
+    let result = filter_narration(&parts);
     assert_eq!(
         result,
         "Here is my analysis.\nI will also note this is fine."
     );
-}
-
-#[test]
-fn test_filter_narration_full_mode() {
-    let parts = vec![
-        "I will fetch commits.".to_string(),
-        "Final answer here.".to_string(),
-    ];
-    let result = filter_narration_with_mode(&parts, false);
-    assert_eq!(result, "I will fetch commits.\nFinal answer here.");
-}
-
-#[test]
-fn test_filter_narration_compact_mode() {
-    let parts = vec![
-        "I will fetch commits.".to_string(),
-        "Final answer here.".to_string(),
-    ];
-    let result = filter_narration_with_mode(&parts, true);
-    assert_eq!(result, "Final answer here.");
 }
 
 #[test]
@@ -1307,7 +1343,7 @@ fn test_filter_narration_all_narration_keeps_last() {
         "I will check the output.".to_string(),
         "I will verify the fix.".to_string(),
     ];
-    let result = filter_narration_with_mode(&parts, true);
+    let result = filter_narration(&parts);
     assert_eq!(result, "I will verify the fix.");
 }
 

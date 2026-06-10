@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{new_conversation_id_in_dir, read_rows_from_db};
-use crate::protobuf::{extract_text_from_step_payload, extract_tool_update_from_step_payload};
+use crate::protobuf::{
+    extract_text_from_step_payload, extract_tool_update_from_step_payload, is_tool_step_type,
+};
 use crate::types::{JsonRpcNotification, StreamingState};
 
 pub fn poll_streaming_delta(
@@ -65,9 +67,7 @@ pub fn poll_streaming_delta(
                     .unwrap(),
                 );
             }
-        } else if matches!(step_type, 7 | 8 | 9 | 17 | 101 | 138)
-            && !guard.emitted_tool_steps.contains(&idx)
-        {
+        } else if is_tool_step_type(step_type) && !guard.emitted_tool_steps.contains(&idx) {
             if let Some(update) = extract_tool_update_from_step_payload(idx, step_type, &payload) {
                 guard.emitted_tool_steps.insert(idx);
                 notifications.push(

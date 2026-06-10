@@ -44,7 +44,6 @@ No separate lint/typecheck/format commands — just `cargo build` and `cargo tes
 | Var | Effect |
 |---|---|
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
-| `OPENAB_TOOL_DISPLAY` | Set to `"full"` to disable narration filtering; default filters "I will ..." prefixes |
 | `GEMINI_API_KEY` | API key for e2e tests and CI |
 
 ## Quirks

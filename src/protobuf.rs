@@ -135,28 +135,27 @@ pub fn extract_printable_strings(blob: &[u8]) -> Vec<String> {
 }
 
 fn looks_like_tool_name(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && s.contains('_')
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && (s.contains('_') || s.chars().any(|c| c.is_ascii_uppercase()))
         && s.len() <= 64
 }
 
 pub fn extract_tool_name(s: &str) -> Option<String> {
-    s.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
-        .find(|part| looks_like_tool_name(part))
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|part| looks_like_tool_name(part) && !part.starts_with("tool"))
         .map(String::from)
 }
 
 pub fn tool_kind(tool_name: &str) -> &'static str {
     let lower = tool_name.to_lowercase();
-    if lower.contains("read") || lower.contains("view") {
-        "read"
-    } else if lower.contains("write") || lower.contains("edit") || lower.contains("patch") {
+    if lower.contains("write") || lower.contains("edit") || lower.contains("patch") {
         "edit"
     } else if lower.contains("delete") || lower.contains("remove") {
         "delete"
     } else if lower.contains("move") || lower.contains("rename") {
         "move"
+    } else if lower.contains("read") || lower.contains("view") {
+        "read"
     } else if lower.contains("grep") || lower.contains("search") || lower.contains("find") {
         "search"
     } else if lower.contains("command") || lower.contains("execute") || lower.contains("terminal") {
@@ -172,6 +171,10 @@ pub fn tool_kind(tool_name: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+pub fn is_tool_step_type(step_type: i64) -> bool {
+    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 101 | 138)
 }
 
 pub fn tool_content(input: &Value) -> Option<Value> {
@@ -249,14 +252,26 @@ pub fn extract_tool_update_from_step_payload(
         }
     });
 
-    let name = strings.iter().find_map(|s| extract_tool_name(s));
+    let name = strings
+        .iter()
+        .find_map(|s| {
+            let trimmed = s.trim();
+            looks_like_tool_name(trimmed).then(|| trimmed.to_string())
+        })
+        .or_else(|| strings.iter().find_map(|s| extract_tool_name(s)));
     let title = raw_input
         .as_ref()
         .and_then(|v| v.get("toolSummary").or_else(|| v.get("toolAction")))
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| name.clone())?;
-    let kind = tool_kind(name.as_deref().unwrap_or(&title));
+    let name_kind = name.as_deref().map(tool_kind).unwrap_or("other");
+    let title_kind = tool_kind(&title);
+    let kind = if title_kind == "other" {
+        name_kind
+    } else {
+        title_kind
+    };
     let tool_call_id = format!("agy-{idx}-{step_type}");
     let locations = raw_input.as_ref().map(tool_locations).unwrap_or_default();
     let content = raw_input.as_ref().and_then(tool_content);

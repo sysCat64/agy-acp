@@ -76,7 +76,6 @@ Set the `AGY_EXTRA_ARGS` environment variable to pass additional arguments to ev
 |---|---|
 | `GEMINI_API_KEY` | API key for Gemini (passed through to `agy`) |
 | `AGY_EXTRA_ARGS` | Space-separated extra args passed to every `agy` invocation |
-| `OPENAB_TOOL_DISPLAY` | Set to `"full"` to disable narration filtering; default filters "I will ..." prefixes |
 
 ## Session Persistence
 
