@@ -31,6 +31,11 @@ fn push_len_field(out: &mut Vec<u8>, field_number: u64, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn push_varint_field(out: &mut Vec<u8>, field_number: u64, value: u64) {
+    push_varint(out, field_number << 3);
+    push_varint(out, value);
+}
+
 fn make_assistant_payload(text: &str) -> Vec<u8> {
     let mut inner = Vec::new();
     push_len_field(&mut inner, 1, text.as_bytes());
@@ -70,6 +75,32 @@ fn make_title_payload(title: &str) -> Vec<u8> {
 
     let mut outer = Vec::new();
     push_len_field(&mut outer, 30, &title_update);
+    outer
+}
+
+fn make_tool_payload(
+    call_id: &str,
+    tool_name: &str,
+    input_json: &str,
+    summary: &str,
+    result_field: Option<(u64, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut call = Vec::new();
+    push_len_field(&mut call, 1, call_id.as_bytes());
+    push_len_field(&mut call, 2, tool_name.as_bytes());
+    push_len_field(&mut call, 3, input_json.as_bytes());
+    push_len_field(&mut call, 9, tool_name.as_bytes());
+
+    let mut tool = Vec::new();
+    push_len_field(&mut tool, 4, &call);
+    push_len_field(&mut tool, 30, summary.as_bytes());
+
+    let mut outer = Vec::new();
+    push_varint_field(&mut outer, 1, 7);
+    push_len_field(&mut outer, 5, &tool);
+    if let Some((field, result)) = result_field {
+        push_len_field(&mut outer, field, &result);
+    }
     outer
 }
 
@@ -195,6 +226,18 @@ fn test_extract_tool_update_parses_first_balanced_json_object() {
 }
 
 #[test]
+fn test_extract_tool_update_kind_prefers_tool_name_over_title() {
+    let payload = br#"
+        view_file
+        {"AbsolutePath":"/tmp/project/flow_graph_write_node.go","toolSummary":"View flow_graph_write_node.go"}
+    "#;
+
+    let update = extract_tool_update_from_step_payload(7, 8, payload).unwrap();
+    assert_eq!(update["title"], "View flow_graph_write_node.go");
+    assert_eq!(update["kind"], "read");
+}
+
+#[test]
 fn test_extract_tool_name_from_embedded_token() {
     assert_eq!(
         extract_tool_name("abc123\tview_file\n{...}"),
@@ -263,6 +306,151 @@ fn test_extract_tool_update_maps_reasoning_to_think_content() {
     assert_eq!(
         update["content"][0]["content"]["text"],
         "Need to inspect the protocol before changing serialization."
+    );
+}
+
+#[test]
+fn test_extract_tool_update_from_structured_grep_payload() {
+    let mut grep = Vec::new();
+    push_len_field(&mut grep, 1, b"StepPayload");
+    push_len_field(&mut grep, 2, b"src/*.rs");
+    push_len_field(&mut grep, 3, b"src/protobuf.rs:1:message StepPayload");
+    push_len_field(&mut grep, 10, b"rg StepPayload src");
+    push_len_field(&mut grep, 11, b"file:///tmp/project");
+    let payload = make_tool_payload(
+        "0t0p5kn3",
+        "grep_search",
+        r#"{"SearchPath":"/tmp/project/src","toolAction":"Searching protobuf schema"}"#,
+        "Proto search",
+        Some((13, grep)),
+    );
+
+    let update = extract_tool_update_from_step_payload(22, 7, &payload).unwrap();
+    assert_eq!(update["toolCallId"], "0t0p5kn3");
+    assert_eq!(update["title"], "Proto search");
+    assert_eq!(update["kind"], "search");
+    assert_eq!(update["rawInput"]["SearchPath"], "/tmp/project/src");
+    assert_eq!(update["rawOutput"]["query"], "StepPayload");
+    assert_eq!(
+        update["rawOutput"]["textOutput"],
+        "src/protobuf.rs:1:message StepPayload"
+    );
+    assert_eq!(update["locations"][0]["path"], "/tmp/project/src");
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\nsrc/protobuf.rs:1:message StepPayload\n```"
+    );
+}
+
+#[test]
+fn test_extract_tool_update_formats_structured_grep_hits_without_text_output() {
+    let mut hit = Vec::new();
+    push_len_field(&mut hit, 1, b"src/protobuf.rs");
+    push_varint_field(&mut hit, 2, 42);
+    push_len_field(&mut hit, 3, b"fn parse_tool_result(blob: &[u8]) -> Option<Value> {");
+
+    let mut grep = Vec::new();
+    push_len_field(&mut grep, 1, b"parse_tool_result");
+    push_len_field(&mut grep, 4, &hit);
+    let payload = make_tool_payload(
+        "grep-hit-call",
+        "grep_search",
+        r#"{"SearchPath":"/tmp/project/src","toolAction":"Searching parser"}"#,
+        "Parser search",
+        Some((13, grep)),
+    );
+
+    let update = extract_tool_update_from_step_payload(26, 7, &payload).unwrap();
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\nfield1: src/protobuf.rs | field2: 42 | field3: fn parse_tool_result(blob: &[u8]) -> Option<Value> {\n```"
+    );
+}
+
+#[test]
+fn test_extract_tool_update_from_structured_view_payload() {
+    let mut view = Vec::new();
+    push_len_field(&mut view, 1, b"file:///tmp/project/src/protobuf.rs");
+    push_varint_field(&mut view, 2, 10);
+    push_varint_field(&mut view, 3, 12);
+    push_len_field(&mut view, 4, b"pub fn read_varint() {}\n```");
+    push_varint_field(&mut view, 11, 13);
+    push_varint_field(&mut view, 12, 200);
+    let payload = make_tool_payload("view-call", "view_file", "{}", "Viewing file", Some((14, view)));
+
+    let update = extract_tool_update_from_step_payload(23, 8, &payload).unwrap();
+    assert_eq!(update["title"], "Viewing file");
+    assert_eq!(update["kind"], "read");
+    assert_eq!(update["rawOutput"]["fileUri"], "file:///tmp/project/src/protobuf.rs");
+    assert_eq!(update["rawOutput"]["startLine"], 10);
+    assert_eq!(update["locations"][0]["path"], "file:///tmp/project/src/protobuf.rs");
+    assert_eq!(update["locations"][0]["line"], 10);
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "````\npub fn read_varint() {}\n```\n````"
+    );
+}
+
+#[test]
+fn test_extract_tool_update_from_structured_list_payload() {
+    let mut entry = Vec::new();
+    push_len_field(&mut entry, 1, b"src");
+    push_varint_field(&mut entry, 2, 1);
+    push_varint_field(&mut entry, 4, 0);
+
+    let mut list = Vec::new();
+    push_len_field(&mut list, 1, b"file:///tmp/project");
+    push_len_field(&mut list, 3, &entry);
+    let payload = make_tool_payload("list-call", "list_dir", "{}", "Listing directory", Some((15, list)));
+
+    let update = extract_tool_update_from_step_payload(24, 9, &payload).unwrap();
+    assert_eq!(update["title"], "Listing directory");
+    assert_eq!(update["kind"], "read");
+    assert_eq!(update["rawOutput"]["dirUri"], "file:///tmp/project");
+    assert_eq!(update["rawOutput"]["entries"][0]["name"], "src");
+    assert_eq!(update["rawOutput"]["entries"][0]["isDirectory"], true);
+    assert_eq!(update["content"][0]["content"]["text"], "```\nsrc/\n```");
+}
+
+#[test]
+fn test_extract_tool_update_formats_empty_structured_list_payload() {
+    let mut list = Vec::new();
+    push_len_field(&mut list, 1, b"file:///tmp/project");
+    let payload = make_tool_payload(
+        "empty-list-call",
+        "list_dir",
+        "{}",
+        "Listing directory",
+        Some((15, list)),
+    );
+
+    let update = extract_tool_update_from_step_payload(27, 9, &payload).unwrap();
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\n(empty directory)\n```"
+    );
+}
+
+#[test]
+fn test_extract_tool_update_from_structured_write_payload() {
+    let mut write = Vec::new();
+    push_len_field(&mut write, 26, b"Wrote 42 bytes");
+    let payload = make_tool_payload(
+        "write-call",
+        "write_to_file",
+        r#"{"AbsolutePath":"/tmp/project/src/main.rs"}"#,
+        "Writing file",
+        Some((10, write)),
+    );
+
+    let update = extract_tool_update_from_step_payload(25, 5, &payload).unwrap();
+    assert_eq!(update["title"], "Writing file");
+    assert_eq!(update["kind"], "edit");
+    assert_eq!(update["rawOutput"]["summary"], "Wrote 42 bytes");
+    assert_eq!(update["locations"][0]["path"], "/tmp/project/src/main.rs");
+    assert_eq!(
+        update["content"][0]["content"]["text"],
+        "```\nWrote 42 bytes\n```"
     );
 }
 
