@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::adapter::is_narration;
 use crate::db::{new_conversation_id_in_dir, read_rows_from_db};
 use crate::protobuf::{
     extract_text_from_step_payload, extract_title_from_step_payload,
@@ -46,6 +47,10 @@ pub fn poll_streaming_delta(
             };
             let written_len = guard.agent_text_lengths.get(&idx).copied().unwrap_or(0);
             if text.len() <= written_len {
+                continue;
+            }
+            if guard.skip_naration && is_narration(&text) {
+                guard.agent_text_lengths.insert(idx, text.len());
                 continue;
             }
             let Some(new_text) = text.get(written_len..) else {

@@ -11,6 +11,8 @@ use crate::protobuf::{
     extract_tool_update_from_step_payload, extract_user_text_from_step_payload, is_tool_step_type,
     read_varint,
 };
+use crate::Cli;
+use clap::Parser;
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
@@ -36,6 +38,17 @@ fn make_assistant_payload(text: &str) -> Vec<u8> {
     let mut outer = Vec::new();
     push_len_field(&mut outer, 20, &inner);
     outer
+}
+
+#[test]
+fn test_parse_skip_naration_flag() {
+    assert!(
+        Cli::try_parse_from(["agy-acp", "--skip-naration"])
+            .unwrap()
+            .skip_naration
+    );
+    assert!(!Cli::try_parse_from(["agy-acp"]).unwrap().skip_naration);
+    assert!(Cli::try_parse_from(["agy-acp", "--skip-narration"]).is_err());
 }
 
 fn make_user_payload(text: &str) -> Vec<u8> {
@@ -303,6 +316,7 @@ fn test_session_load_restores_persisted_session() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
 
@@ -336,6 +350,7 @@ fn test_session_load_rejects_unknown_session() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let output = adapter.handle_session_load(json!(9), &json!({"sessionId": "missing"}));
@@ -442,6 +457,7 @@ fn test_session_load_replays_conversation_history() {
         conversations_dir: conv_dir,
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.persist_session("sess-replay", Some("conv-replay"), 8, None);
 
@@ -564,6 +580,7 @@ fn test_session_resume_restores_persisted_session() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.persist_session("sess-r1", Some("conv-xyz"), 3, None);
 
@@ -604,6 +621,7 @@ fn test_session_resume_rejects_unknown_session() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let response = adapter.handle_session_resume(json!(11), &json!({"sessionId": "nope"}));
@@ -643,6 +661,7 @@ fn test_session_resume_accepts_in_memory_session() {
         conversations_dir: PathBuf::from("/tmp/conversations"),
         state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.sessions.insert(
         "sess-memory".to_string(),
@@ -674,6 +693,7 @@ fn test_session_load_accepts_in_memory_session_without_replay() {
         conversations_dir: PathBuf::from("/tmp/conversations"),
         state_file: PathBuf::from("/tmp/nonexistent-agy-acp-sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.sessions.insert(
         "sess-memory-load".to_string(),
@@ -704,6 +724,7 @@ fn test_session_resume_does_not_replay_history() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     adapter.persist_session("sess-nr", Some("conv-nr"), 10, None);
 
@@ -735,6 +756,7 @@ fn test_snapshot_detects_db_conversations() {
         conversations_dir: conv_dir.clone(),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let before = adapter.conversation_snapshot();
@@ -764,6 +786,7 @@ fn test_snapshot_ignores_multiple_new_files() {
         conversations_dir: conv_dir.clone(),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let before = adapter.conversation_snapshot();
@@ -786,6 +809,7 @@ fn test_persist_and_restore_session() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
@@ -850,6 +874,7 @@ fn test_read_response_from_db() {
         conversations_dir: conv_dir,
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let result = adapter.read_response_from_db("test-conv", -1);
@@ -1296,6 +1321,7 @@ fn test_read_response_multi_step_no_skip_no_duplicate() {
         conversations_dir: conv_dir,
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let result = adapter.read_response_from_db("multi", -1);
@@ -1335,6 +1361,7 @@ fn test_read_response_missing_steps_table() {
         conversations_dir: conv_dir,
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     let result = adapter.read_response_from_db("empty", -1);
@@ -1364,14 +1391,14 @@ fn test_is_narration_false() {
 }
 
 #[test]
-fn test_filter_narration_drops_leading_narration() {
+fn test_filter_narration_drops_all_narration() {
     let parts = vec![
         "I will fetch the latest commits.\nI will check the diff.".to_string(),
         "I will read the file.".to_string(),
         "The fix is confirmed! LGTM ✅".to_string(),
     ];
     let result = filter_narration(&parts);
-    assert_eq!(result, "The fix is confirmed! LGTM ✅");
+    assert_eq!(result.as_deref(), Some("The fix is confirmed! LGTM ✅"));
 }
 
 #[test]
@@ -1382,28 +1409,25 @@ fn test_filter_narration_preserves_content_after_first_non_narration() {
         "I will also note this is fine.".to_string(),
     ];
     let result = filter_narration(&parts);
-    assert_eq!(
-        result,
-        "Here is my analysis.\nI will also note this is fine."
-    );
+    assert_eq!(result.as_deref(), Some("Here is my analysis."));
 }
 
 #[test]
 fn test_filter_narration_single_part_unchanged() {
     let parts = vec!["I will do something.".to_string()];
     let result = Adapter::filter_narration(&parts);
-    assert_eq!(result, "I will do something.");
+    assert_eq!(result, None);
 }
 
 #[test]
-fn test_filter_narration_all_narration_keeps_last() {
+fn test_filter_narration_all_narration_drops_all() {
     let parts = vec![
         "I will fetch the file.".to_string(),
         "I will check the output.".to_string(),
         "I will verify the fix.".to_string(),
     ];
     let result = filter_narration(&parts);
-    assert_eq!(result, "I will verify the fix.");
+    assert_eq!(result, None);
 }
 
 #[test]
@@ -1529,6 +1553,7 @@ fn test_session_set_model_persists() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
 
     adapter.persist_session("sess-m1", Some("conv-m1"), 0, None);
@@ -1545,6 +1570,7 @@ fn test_session_set_model_persists() {
         conversations_dir: root.join("conversations"),
         state_file: root.join("sessions.json"),
         available_models: vec![],
+        skip_naration: false,
     };
     let restored = adapter2.restore_session("sess-m1");
     assert_eq!(

@@ -3,10 +3,10 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::adapter::filter_narration;
 use crate::protobuf::{
     extract_text_from_step_payload, extract_tool_update_from_step_payload,
-    extract_user_text_from_step_payload, flush_agent_message, is_tool_step_type,
-    message_chunk_update,
+    extract_user_text_from_step_payload, is_tool_step_type, message_chunk_update,
 };
 
 #[cfg(test)]
@@ -87,6 +87,7 @@ pub fn read_rows_from_db(
 pub fn read_replay_updates_from_db(
     conversations_dir: &Path,
     conversation_id: &str,
+    skip_naration: bool,
 ) -> Option<(Vec<Value>, i64)> {
     let rows = read_rows_from_db(conversations_dir, conversation_id, -1)?;
     let mut max_idx = -1;
@@ -96,7 +97,7 @@ pub fn read_replay_updates_from_db(
     for (idx, step_type, payload) in &rows {
         max_idx = max_idx.max(*idx);
         if *step_type == 14 {
-            flush_agent_message(&mut pending_agent_parts, &mut updates);
+            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
             if let Some(text) = extract_user_text_from_step_payload(payload) {
                 updates.push(message_chunk_update("user_message_chunk", text));
             }
@@ -107,13 +108,13 @@ pub fn read_replay_updates_from_db(
                 }
             }
         } else if is_tool_step_type(*step_type) {
-            flush_agent_message(&mut pending_agent_parts, &mut updates);
+            flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
             if let Some(update) = extract_tool_update_from_step_payload(*idx, *step_type, payload) {
                 updates.push(update);
             }
         }
     }
-    flush_agent_message(&mut pending_agent_parts, &mut updates);
+    flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
 
     if updates.is_empty() {
         return None;
@@ -159,10 +160,27 @@ pub fn read_delta_from_db(
     let text = if response_parts.is_empty() {
         None
     } else {
-        Some(crate::adapter::filter_narration(&response_parts))
+        Some(response_parts.join("\n"))
     };
     Some(ConversationDelta {
         text,
         max_step_idx: max_idx,
     })
+}
+
+fn flush_agent_message(parts: &mut Vec<String>, updates: &mut Vec<Value>, skip_naration: bool) {
+    if parts.is_empty() {
+        return;
+    }
+    let text = if skip_naration {
+        filter_narration(parts)
+    } else {
+        Some(parts.join("\n"))
+    };
+    parts.clear();
+    if let Some(text) = text {
+        if !text.is_empty() {
+            updates.push(message_chunk_update("agent_message_chunk", text));
+        }
+    }
 }

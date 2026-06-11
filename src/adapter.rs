@@ -24,12 +24,17 @@ pub struct Adapter {
     pub conversations_dir: PathBuf,
     pub state_file: PathBuf,
     pub available_models: Vec<String>,
+    pub skip_naration: bool,
 }
 
 impl Adapter {
     pub const MODEL_CONFIG_ID: &'static str = "model";
 
     pub fn new() -> Self {
+        Self::new_with_skip_naration(false)
+    }
+
+    pub fn new_with_skip_naration(skip_naration: bool) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
         Self {
@@ -40,6 +45,7 @@ impl Adapter {
             conversations_dir: PathBuf::from(&home).join(".gemini/antigravity-cli/conversations"),
             state_file: state_dir.join("sessions.json"),
             available_models: Self::fetch_available_models(),
+            skip_naration,
         }
     }
 
@@ -232,7 +238,7 @@ impl Adapter {
         &self,
         conversation_id: &str,
     ) -> Option<(Vec<Value>, i64)> {
-        read_replay_updates_from_db(&self.conversations_dir, conversation_id)
+        read_replay_updates_from_db(&self.conversations_dir, conversation_id, self.skip_naration)
     }
 
     #[cfg(test)]
@@ -256,7 +262,7 @@ impl Adapter {
 
     /// Filter out leading narration ("I will ...") from response parts.
     #[cfg(test)]
-    pub fn filter_narration(parts: &[String]) -> String {
+    pub fn filter_narration(parts: &[String]) -> Option<String> {
         filter_narration(parts)
     }
 
@@ -676,6 +682,7 @@ impl Adapter {
             agent_text_lengths: HashMap::new(),
             emitted_tool_steps: HashSet::new(),
             last_title: None,
+            skip_naration: self.skip_naration,
         }));
         let stop_polling = Arc::new(AtomicBool::new(false));
         let poll_conversations_dir = self.conversations_dir.clone();
@@ -804,22 +811,18 @@ impl Adapter {
 }
 
 /// Filter out leading narration ("I will ...") from response parts.
-#[cfg(test)]
-pub fn filter_narration(parts: &[String]) -> String {
-    if parts.len() <= 1 {
-        return parts.join("\n");
-    }
-
-    let first_content = parts
+pub fn filter_narration(parts: &[String]) -> Option<String> {
+    let text = parts
         .iter()
-        .position(|p| !is_narration(p))
-        .unwrap_or(parts.len() - 1);
-    parts[first_content..].join("\n")
+        .filter(|part| !is_narration(part))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 /// A part is considered narration if every non-empty line starts with "I will".
-#[cfg(test)]
-fn is_narration(text: &str) -> bool {
+pub fn is_narration(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         return false;

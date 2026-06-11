@@ -234,17 +234,6 @@ pub fn message_chunk_update(session_update: &str, text: String) -> Value {
     })
 }
 
-pub fn flush_agent_message(parts: &mut Vec<String>, updates: &mut Vec<Value>) {
-    if parts.is_empty() {
-        return;
-    }
-    let text = parts.join("\n");
-    parts.clear();
-    if !text.is_empty() {
-        updates.push(message_chunk_update("agent_message_chunk", text));
-    }
-}
-
 pub fn extract_tool_update_from_step_payload(
     idx: i64,
     step_type: i64,

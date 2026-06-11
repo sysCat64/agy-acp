@@ -12,11 +12,25 @@ use std::io::{self, BufRead, Write};
 use tokio::sync::mpsc;
 
 use adapter::Adapter;
+use clap::Parser;
 use types::{JsonRpcRequest, JsonRpcResponse};
+
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Skip pure narration messages from agy, such as "I will ...".
+    #[arg(long = "skip-naration", default_value_t = false)]
+    skip_naration: bool,
+}
 
 #[tokio::main]
 async fn main() {
-    let mut adapter = Adapter::new();
+    let cli = Cli::parse();
+    let mut adapter = if cli.skip_naration {
+        Adapter::new_with_skip_naration(true)
+    } else {
+        Adapter::new()
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
