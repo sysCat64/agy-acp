@@ -1373,8 +1373,10 @@ fn test_read_response_missing_steps_table() {
 #[test]
 fn test_is_narration_true() {
     assert!(Adapter::is_narration("I will fetch the latest commits."));
+    assert!(Adapter::is_narration("I'll fetch the latest commits."));
+    assert!(Adapter::is_narration("I’ll fetch the latest commits."));
     assert!(Adapter::is_narration(
-        "I will fetch the latest commits.\nI will check the diff."
+        "I will fetch the latest commits.\nI'll check the diff."
     ));
     assert!(Adapter::is_narration(
         "I will read the file.\n\nI will analyze the output."
@@ -1423,7 +1425,7 @@ fn test_filter_narration_single_part_unchanged() {
 fn test_filter_narration_all_narration_drops_all() {
     let parts = vec![
         "I will fetch the file.".to_string(),
-        "I will check the output.".to_string(),
+        "I'll check the output.".to_string(),
         "I will verify the fix.".to_string(),
     ];
     let result = filter_narration(&parts);

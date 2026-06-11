@@ -261,20 +261,23 @@ impl Adapter {
             .and_then(|delta| delta.text.map(|text| (text, delta.max_step_idx)))
     }
 
-    /// Filter out leading narration ("I will ...") from response parts.
+    /// Filter out leading narration ("I will ...", "I'll ...") from response parts.
     #[cfg(test)]
     pub fn filter_narration(parts: &[String]) -> Option<String> {
         filter_narration(parts)
     }
 
-    /// A part is considered narration if every non-empty line starts with "I will".
+    /// A part is considered narration if every non-empty line starts with "I will" or "I'll".
     #[cfg(test)]
     pub fn is_narration(text: &str) -> bool {
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.is_empty() {
             return false;
         }
-        lines.iter().all(|l| l.trim_start().starts_with("I will"))
+        lines.iter().all(|l| {
+            let line = l.trim_start();
+            line.starts_with("I will") || line.starts_with("I'll") || line.starts_with("I’ll")
+        })
     }
 
     fn evict_if_needed(&mut self) {
@@ -853,7 +856,7 @@ impl Adapter {
     }
 }
 
-/// Filter out leading narration ("I will ...") from response parts.
+/// Filter out leading narration ("I will ...", "I'll ...") from response parts.
 pub fn filter_narration(parts: &[String]) -> Option<String> {
     let text = parts
         .iter()
@@ -864,11 +867,14 @@ pub fn filter_narration(parts: &[String]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// A part is considered narration if every non-empty line starts with "I will".
+/// A part is considered narration if every non-empty line starts with "I will" or "I'll".
 pub fn is_narration(text: &str) -> bool {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         return false;
     }
-    lines.iter().all(|l| l.trim_start().starts_with("I will"))
+    lines.iter().all(|l| {
+        let line = l.trim_start();
+        line.starts_with("I will") || line.starts_with("I'll") || line.starts_with("I’ll")
+    })
 }
