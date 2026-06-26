@@ -7,10 +7,14 @@ use uuid::Uuid;
 
 use crate::adapter::{filter_narration, Adapter};
 use crate::protobuf::{
+    extract_image_artifact_from_step_payload, extract_image_artifact_from_step_payload_in_dir,
     extract_text_from_step_payload, extract_title_from_step_payload, extract_tool_name,
-    extract_tool_update_from_step_payload, extract_user_text_from_step_payload, is_tool_step_type,
-    read_varint,
+    extract_tool_update_from_step_payload, extract_user_text_from_step_payload,
+    image_markdown_message, is_tool_step_type, materialize_data_uri_image, read_varint,
 };
+use crate::streaming::poll_streaming_delta;
+use crate::types::StreamingState;
+use std::sync::{Arc, Mutex};
 use crate::Cli;
 use clap::Parser;
 
@@ -1860,6 +1864,409 @@ fn test_session_models_json_with_model() {
     assert_eq!(available.len(), 2);
     assert_eq!(available[0]["modelId"].as_str(), Some("Model A"));
     assert_eq!(available[1]["modelId"].as_str(), Some("Model B"));
+}
+
+/// Build a synthetic generate_image step_payload mirroring real agy data:
+///   top.1 varint = 91
+///   top.5 (sub-msg) = tool call with name "generate_image" and title "Image generation"
+///   top.104 (sub-msg) = image metadata
+///     .1 prompt, .4 ImageName, .5 model
+///     .6 (sub-msg) = media ref
+///       .1 MIME, .5 file URI
+fn make_image_step_payload(name: &str, mime: &str, file_uri: &str) -> Vec<u8> {
+    let mut media = Vec::new();
+    push_len_field(&mut media, 1, mime.as_bytes());
+    push_len_field(&mut media, 5, file_uri.as_bytes());
+
+    let mut image_meta = Vec::new();
+    push_len_field(&mut image_meta, 1, b"a prompt");
+    push_len_field(&mut image_meta, 4, name.as_bytes());
+    push_len_field(&mut image_meta, 5, b"gemini-3.1-flash-image");
+    push_len_field(&mut image_meta, 6, &media);
+
+    let tool_payload = make_tool_payload(
+        "img-call-1",
+        "generate_image",
+        &format!(r#"{{"ImageName":"{name}","toolSummary":"Image generation"}}"#),
+        "Image generation",
+        None,
+    );
+
+    let mut payload = tool_payload;
+    push_len_field(&mut payload, 104, &image_meta);
+    payload
+}
+
+#[test]
+fn test_is_tool_step_type_includes_generate_image_step() {
+    assert!(
+        is_tool_step_type(91),
+        "step_type 91 (generate_image) must be recognised as a tool step"
+    );
+}
+
+#[test]
+fn test_extract_image_artifact_from_step_payload_file_uri() {
+    let payload = make_image_step_payload(
+        "ui_mockup",
+        "image/jpeg",
+        "file:///tmp/generated.png",
+    );
+    let artifact = extract_image_artifact_from_step_payload(&payload)
+        .expect("image artifact must be extracted");
+    assert_eq!(artifact.absolute_path, "/tmp/generated.png");
+    assert_eq!(artifact.mime.as_deref(), Some("image/jpeg"));
+    assert_eq!(artifact.name.as_deref(), Some("ui_mockup"));
+}
+
+#[test]
+fn test_extract_image_artifact_percent_decodes_file_uri_spaces() {
+    // `file:///tmp/my%20image.png` must point to `/tmp/my image.png` on disk,
+    // not the literal `/tmp/my%20image.png` which the OS would never find.
+    let payload = make_image_step_payload(
+        "spaced",
+        "image/png",
+        "file:///tmp/my%20image.png",
+    );
+    let artifact = extract_image_artifact_from_step_payload(&payload)
+        .expect("percent-encoded file URI must decode");
+    assert_eq!(artifact.absolute_path, "/tmp/my image.png");
+}
+
+#[test]
+fn test_extract_image_artifact_percent_decodes_utf8_file_uri() {
+    // `あ` is U+3042, encoded as %E3%81%82 in UTF-8 percent-encoding.
+    let payload = make_image_step_payload(
+        "japanese",
+        "image/png",
+        "file:///tmp/%E3%81%82.png",
+    );
+    let artifact = extract_image_artifact_from_step_payload(&payload)
+        .expect("UTF-8 percent-encoded file URI must decode");
+    assert_eq!(artifact.absolute_path, "/tmp/あ.png");
+}
+
+#[test]
+fn test_extract_image_artifact_leaves_bare_absolute_path_unchanged() {
+    // A bare absolute path that happens to contain `%` is NOT URL-encoded —
+    // it must round-trip verbatim.
+    let payload =
+        make_image_step_payload("raw", "image/png", "/tmp/100%25 done.png");
+    let artifact = extract_image_artifact_from_step_payload(&payload)
+        .expect("bare absolute path must be accepted as-is");
+    assert_eq!(artifact.absolute_path, "/tmp/100%25 done.png");
+}
+
+#[test]
+fn test_extract_image_artifact_accepts_bare_absolute_path() {
+    let payload = make_image_step_payload("banana", "image/png", "/var/folders/x/banana.jpg");
+    let artifact = extract_image_artifact_from_step_payload(&payload)
+        .expect("absolute path without file:// scheme must work");
+    assert_eq!(artifact.absolute_path, "/var/folders/x/banana.jpg");
+}
+
+#[test]
+fn test_extract_image_artifact_rejects_non_image_extension() {
+    let payload = make_image_step_payload("note", "text/plain", "file:///tmp/note.txt");
+    assert!(
+        extract_image_artifact_from_step_payload(&payload).is_none(),
+        "non-image extensions must be rejected"
+    );
+}
+
+#[test]
+fn test_extract_image_artifact_returns_none_without_field_104() {
+    let payload = make_tool_payload(
+        "non-image",
+        "view_file",
+        r#"{"AbsolutePath":"/tmp/x"}"#,
+        "View file",
+        None,
+    );
+    assert!(extract_image_artifact_from_step_payload(&payload).is_none());
+}
+
+#[test]
+fn test_image_markdown_message_formats_link() {
+    assert_eq!(
+        image_markdown_message("/tmp/generated.png"),
+        "![Generated image](/tmp/generated.png)"
+    );
+}
+
+#[test]
+fn test_image_markdown_message_escapes_closing_paren() {
+    // A path containing `)` would prematurely close the markdown URL part.
+    assert_eq!(
+        image_markdown_message("/tmp/weird (1).png"),
+        r"![Generated image](/tmp/weird (1\).png)"
+    );
+}
+
+#[test]
+fn test_image_markdown_message_escapes_backslash() {
+    // A literal backslash should be doubled so the markdown URL stays valid.
+    assert_eq!(
+        image_markdown_message(r"/tmp/odd\path.png"),
+        r"![Generated image](/tmp/odd\\path.png)"
+    );
+}
+
+/// A 1×1 transparent PNG, base64-encoded — small enough to inline for tests.
+const PNG_1X1_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=";
+
+#[test]
+#[ignore]
+fn test_materialize_data_uri_image_writes_png_to_dir() {
+    let dir = std::env::temp_dir().join(format!("agy-acp-mat-{}", Uuid::new_v4()));
+    let path = materialize_data_uri_image(PNG_1X1_DATA_URI, &dir)
+        .expect("data uri must materialize to a path");
+    assert!(path.ends_with(".png"), "expected .png extension, got {path}");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "materialized file must contain a real PNG header"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_materialize_data_uri_image_rejects_non_image_mime() {
+    let dir = std::env::temp_dir().join(format!("agy-acp-mat-rej-{}", Uuid::new_v4()));
+    // text/plain is not an image — should be refused even if base64 is valid.
+    let uri = "data:text/plain;base64,aGVsbG8=";
+    assert!(materialize_data_uri_image(uri, &dir).is_none());
+}
+
+#[test]
+fn test_materialize_data_uri_image_rejects_non_base64_payload() {
+    let dir = std::env::temp_dir().join(format!("agy-acp-mat-raw-{}", Uuid::new_v4()));
+    // Missing `;base64` marker — raw data URIs are not supported.
+    let uri = "data:image/png,not-base64";
+    assert!(materialize_data_uri_image(uri, &dir).is_none());
+}
+
+#[test]
+#[ignore]
+fn test_extract_image_artifact_materializes_data_uri() {
+    // Scope materialization to $TMPDIR so the test never touches ~/.openab/agy-acp.
+    let dir = std::env::temp_dir().join(format!("agy-acp-ext-{}", Uuid::new_v4()));
+    let payload = make_image_step_payload("inline_img", "image/png", PNG_1X1_DATA_URI);
+    let artifact = extract_image_artifact_from_step_payload_in_dir(&payload, &dir)
+        .expect("data URI payload must yield an image artifact");
+    assert!(
+        artifact.absolute_path.starts_with(dir.to_str().unwrap()),
+        "artifact must live under the injected tempdir, got {}",
+        artifact.absolute_path
+    );
+    assert!(
+        artifact.absolute_path.ends_with(".png"),
+        "got {}",
+        artifact.absolute_path
+    );
+    let bytes = std::fs::read(&artifact.absolute_path).unwrap();
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_extract_tool_update_for_generate_image_step() {
+    let payload = make_image_step_payload(
+        "ui_mockup",
+        "image/jpeg",
+        "file:///tmp/generated.png",
+    );
+    let update = extract_tool_update_from_step_payload(8, 91, &payload)
+        .expect("step_type 91 must yield a tool_call update");
+    assert_eq!(update["sessionUpdate"], "tool_call");
+    assert_eq!(update["toolCallId"], "img-call-1");
+    assert_eq!(update["title"], "Image generation");
+}
+
+#[test]
+#[ignore]
+fn test_streaming_emits_generate_image_markdown_chunk_only_once() {
+    let root = std::env::temp_dir().join(format!("agy-acp-stream-img-{}", Uuid::new_v4()));
+    let conv_dir = root.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let db_path = conv_dir.join("conv-stream.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT 0,
+            metadata BLOB,
+            error_details BLOB,
+            permissions BLOB,
+            task_details BLOB,
+            render_info BLOB,
+            step_payload BLOB,
+            step_format INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 91, ?2)",
+        rusqlite::params![
+            3i64,
+            make_image_step_payload(
+                "banner",
+                "image/png",
+                "file:///tmp/agy-acp-test/banner.png",
+            )
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let state = Arc::new(Mutex::new(StreamingState {
+        conversation_id: Some("conv-stream".to_string()),
+        base_step_idx: -1,
+        last_step_idx: -1,
+        had_updates: false,
+        agent_text_lengths: HashMap::new(),
+        emitted_tool_steps: std::collections::HashSet::new(),
+        emitted_image_steps: std::collections::HashSet::new(),
+        last_title: None,
+        skip_naration: false,
+    }));
+
+    let first = poll_streaming_delta(&conv_dir, None, "sess-x", &state);
+    let second = poll_streaming_delta(&conv_dir, None, "sess-x", &state);
+
+    fn collect_image_chunks(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|n| n["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|n| {
+                n["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .filter(|text| text.contains("![Generated image]"))
+            .collect()
+    }
+
+    let first_chunks = collect_image_chunks(&first);
+    let second_chunks = collect_image_chunks(&second);
+
+    assert_eq!(
+        first_chunks.len(),
+        1,
+        "first poll should emit exactly one image markdown chunk"
+    );
+    assert!(
+        first_chunks[0].contains("![Generated image](/tmp/agy-acp-test/banner.png)"),
+        "image chunk should contain the markdown link"
+    );
+    assert_eq!(
+        second_chunks.len(),
+        0,
+        "second poll should NOT re-emit the same image"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore]
+fn test_session_load_replays_generate_image_as_markdown_chunk() {
+    let root = std::env::temp_dir().join(format!("agy-acp-image-{}", Uuid::new_v4()));
+    let conv_dir = root.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let db_path = conv_dir.join("conv-image.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT 0,
+            metadata BLOB,
+            error_details BLOB,
+            permissions BLOB,
+            task_details BLOB,
+            render_info BLOB,
+            step_payload BLOB,
+            step_format INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
+        rusqlite::params![1i64, make_user_payload("draw a banana")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)",
+        rusqlite::params![2i64, make_assistant_payload("Sure, generating now.")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 91, ?2)",
+        rusqlite::params![
+            3i64,
+            make_image_step_payload(
+                "happy_banana",
+                "image/jpeg",
+                "file:///tmp/agy-acp-test/happy_banana.png",
+            )
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut adapter = Adapter {
+        sessions: HashMap::new(),
+        working_dir: root.to_string_lossy().to_string(),
+        conversations_dir: conv_dir,
+        state_file: root.join("sessions.json"),
+        available_models: vec![],
+        skip_naration: false,
+    };
+    adapter.persist_session("sess-img", Some("conv-image"), -1, None);
+
+    let output = adapter.handle_session_load(json!(1), &json!({"sessionId": "sess-img"}));
+    let updates: Vec<Value> = output[..output.len() - 1]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let session_updates: Vec<&str> = updates
+        .iter()
+        .map(|n| n["params"]["update"]["sessionUpdate"].as_str().unwrap())
+        .collect();
+
+    // Expected sequence: user, assistant text (flushed), tool_call, agent_message_chunk (image).
+    assert_eq!(
+        session_updates,
+        vec![
+            "user_message_chunk",
+            "agent_message_chunk",
+            "tool_call",
+            "agent_message_chunk",
+        ],
+        "pending assistant text must be flushed before the image is emitted"
+    );
+
+    let image_chunk = updates
+        .last()
+        .expect("expected an image markdown chunk at the end");
+    assert_eq!(
+        image_chunk["params"]["update"]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .trim(),
+        "![Generated image](/tmp/agy-acp-test/happy_banana.png)"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

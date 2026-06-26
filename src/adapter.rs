@@ -708,6 +708,7 @@ impl Adapter {
             had_updates: false,
             agent_text_lengths: HashMap::new(),
             emitted_tool_steps: HashSet::new(),
+            emitted_image_steps: HashSet::new(),
             last_title: None,
             skip_naration: self.skip_naration,
         }));
