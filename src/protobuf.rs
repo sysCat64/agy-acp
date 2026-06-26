@@ -246,7 +246,239 @@ pub fn tool_kind(tool_name: &str) -> &'static str {
 }
 
 pub fn is_tool_step_type(step_type: i64) -> bool {
-    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 138)
+    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 91 | 101 | 138)
+}
+
+/// Step type emitted by agy for the `generate_image` tool.
+pub const GENERATE_IMAGE_STEP_TYPE: i64 = 91;
+
+/// Image artifact extracted from a step_payload's field 104 (generate_image metadata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageArtifact {
+    pub absolute_path: String,
+    pub mime: Option<String>,
+    pub name: Option<String>,
+}
+
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "avif", "bmp", "tiff", "tif",
+];
+
+fn has_image_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    IMAGE_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
+/// Strip a `file://` scheme and percent-decode the path. Returns the absolute path.
+///
+/// `file:///Users/x/a.png` → `/Users/x/a.png`
+/// `file:///tmp/my%20image.png` → `/tmp/my image.png`
+/// `file:///tmp/%E3%81%82.png` → `/tmp/あ.png`
+/// `/Users/x/a.png` → `/Users/x/a.png` (bare paths are returned verbatim — they
+/// are not URL-encoded, so a literal `%` must round-trip unchanged.)
+fn normalize_file_uri(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (path, decode) = if let Some(rest) = trimmed.strip_prefix("file://") {
+        // file:///abs/path → /abs/path; file://localhost/abs/path → /abs/path
+        let stripped = rest.strip_prefix("localhost").unwrap_or(rest);
+        (stripped.to_string(), true)
+    } else {
+        (trimmed.to_string(), false)
+    };
+    if !path.starts_with('/') {
+        return None;
+    }
+    if decode {
+        percent_decode(&path)
+    } else {
+        Some(path)
+    }
+}
+
+/// Decode RFC 3986 percent-encoding into a UTF-8 string. Returns `None` if the
+/// resulting bytes are not valid UTF-8 (e.g. corrupted input). `%` followed by
+/// non-hex is preserved literally so partially-encoded strings degrade gracefully.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Extract a generated image artifact from a step_payload, materializing any
+/// inline `data:image/...;base64,...` URI into the per-user default cache dir.
+/// See [`extract_image_artifact_from_step_payload_in_dir`] for an injectable cache
+/// dir variant used by tests.
+pub fn extract_image_artifact_from_step_payload(blob: &[u8]) -> Option<ImageArtifact> {
+    extract_image_artifact_from_step_payload_in_dir(blob, &default_image_cache_dir())
+}
+
+/// `extract_image_artifact_from_step_payload` with an explicit cache dir for inline
+/// `data:` URIs — lets tests scope I/O to `$TMPDIR`.
+///
+/// Protobuf shape:
+/// top.104 (image metadata) -> field 6 (media ref) -> field 5 (file URI / absolute path / data URI).
+/// MIME comes from media ref field 1; ImageName from top.104 field 4.
+/// `file://` and bare absolute paths are returned as-is; `data:image/...;base64,...`
+/// is materialized into `cache_dir`.
+pub fn extract_image_artifact_from_step_payload_in_dir(
+    blob: &[u8],
+    cache_dir: &std::path::Path,
+) -> Option<ImageArtifact> {
+    let image_meta = get_proto_field(blob, 104)?;
+    let media = get_proto_field(&image_meta, 6)?;
+    let raw_uri = get_text_field(&media, 5)?;
+    let absolute_path = if let Some(path) = normalize_file_uri(&raw_uri) {
+        if !has_image_extension(&path) {
+            return None;
+        }
+        path
+    } else if raw_uri.starts_with("data:image/") {
+        materialize_data_uri_image(&raw_uri, cache_dir)?
+    } else {
+        return None;
+    };
+    let mime = get_text_field(&media, 1).filter(|m| !m.is_empty());
+    let name = get_text_field(&image_meta, 4).filter(|n| !n.trim().is_empty());
+    Some(ImageArtifact {
+        absolute_path,
+        mime,
+        name,
+    })
+}
+
+/// Default cache dir for materialized inline images. Prefers `~/.openab/agy-acp/images`
+/// (sibling of `sessions.json`); falls back to the OS temp dir if `HOME` is unset.
+pub fn default_image_cache_dir() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".openab/agy-acp/images"))
+        .unwrap_or_else(|| std::env::temp_dir().join("agy-acp-images"))
+}
+
+/// Decode a `data:image/<ext>;base64,<payload>` URI, write its bytes to `dir`, and
+/// return the resulting absolute path. Returns `None` for raw (non-base64) data URIs,
+/// non-image MIME types, or decode failures.
+pub fn materialize_data_uri_image(
+    data_uri: &str,
+    dir: &std::path::Path,
+) -> Option<String> {
+    let rest = data_uri.strip_prefix("data:")?;
+    let (header, body) = rest.split_once(',')?;
+    if !header.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    let mime = header.split(';').next()?.to_ascii_lowercase();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let ext = mime_to_extension(&mime)?;
+    let bytes = decode_base64(body)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let name = format!("agy-{:016x}.{}", fnv1a_64(&bytes), ext);
+    let path = dir.join(&name);
+    if !path.exists() {
+        std::fs::write(&path, &bytes).ok()?;
+    }
+    Some(path.to_string_lossy().to_string())
+}
+
+fn mime_to_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/avif" => Some("avif"),
+        "image/bmp" => Some("bmp"),
+        "image/tiff" => Some("tiff"),
+        _ => None,
+    }
+}
+
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn lookup(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for &b in chunk {
+            v = (v << 6) | (lookup(b)? as u32);
+        }
+        v <<= (4 - chunk.len()) * 6;
+        out.push(((v >> 16) & 0xFF) as u8);
+        if chunk.len() > 2 {
+            out.push(((v >> 8) & 0xFF) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push((v & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Format the markdown image link Paseo will display inline in the assistant message.
+/// The URL portion has `)` and `\` escaped so paths with parentheses or backslashes
+/// don't prematurely terminate the link.
+pub fn image_markdown_message(absolute_path: &str) -> String {
+    format!("![Generated image]({})", escape_markdown_url(absolute_path))
+}
+
+fn escape_markdown_url(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            ')' => out.push_str(r"\)"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn fenced_code_block(text: &str) -> String {

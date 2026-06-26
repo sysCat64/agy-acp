@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use crate::adapter::is_narration;
 use crate::db::{new_conversation_id_in_dir, read_rows_from_db};
 use crate::protobuf::{
-    extract_text_from_step_payload, extract_title_from_step_payload,
-    extract_tool_update_from_step_payload, is_tool_step_type,
+    extract_image_artifact_from_step_payload, extract_text_from_step_payload,
+    extract_title_from_step_payload, extract_tool_update_from_step_payload, image_markdown_message,
+    is_tool_step_type, GENERATE_IMAGE_STEP_TYPE,
 };
 use crate::types::{JsonRpcNotification, StreamingState};
 
@@ -95,20 +96,44 @@ pub fn poll_streaming_delta(
                 })
                 .unwrap(),
             );
-        } else if is_tool_step_type(step_type) && !guard.emitted_tool_steps.contains(&idx) {
-            if let Some(update) = extract_tool_update_from_step_payload(idx, step_type, &payload) {
-                guard.emitted_tool_steps.insert(idx);
-                notifications.push(
-                    serde_json::to_string(&JsonRpcNotification {
-                        jsonrpc: "2.0",
-                        method: "session/update".to_string(),
-                        params: json!({
-                            "sessionId": session_id,
-                            "update": update,
-                        }),
-                    })
-                    .unwrap(),
-                );
+        } else if is_tool_step_type(step_type) {
+            if !guard.emitted_tool_steps.contains(&idx) {
+                if let Some(update) =
+                    extract_tool_update_from_step_payload(idx, step_type, &payload)
+                {
+                    guard.emitted_tool_steps.insert(idx);
+                    notifications.push(
+                        serde_json::to_string(&JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".to_string(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": update,
+                            }),
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+            if step_type == GENERATE_IMAGE_STEP_TYPE && !guard.emitted_image_steps.contains(&idx) {
+                if let Some(artifact) = extract_image_artifact_from_step_payload(&payload) {
+                    guard.emitted_image_steps.insert(idx);
+                    let text = format!("\n{}\n", image_markdown_message(&artifact.absolute_path));
+                    notifications.push(
+                        serde_json::to_string(&JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".to_string(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": text },
+                                },
+                            }),
+                        })
+                        .unwrap(),
+                    );
+                }
             }
         }
     }

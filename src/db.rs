@@ -5,8 +5,10 @@ use std::path::Path;
 
 use crate::adapter::filter_narration;
 use crate::protobuf::{
-    extract_text_from_step_payload, extract_tool_update_from_step_payload,
-    extract_user_text_from_step_payload, is_tool_step_type, message_chunk_update,
+    extract_image_artifact_from_step_payload, extract_text_from_step_payload,
+    extract_tool_update_from_step_payload, extract_user_text_from_step_payload,
+    image_markdown_message, is_tool_step_type, message_chunk_update,
+    GENERATE_IMAGE_STEP_TYPE,
 };
 
 #[cfg(test)]
@@ -111,6 +113,14 @@ pub fn read_replay_updates_from_db(
             flush_agent_message(&mut pending_agent_parts, &mut updates, skip_naration);
             if let Some(update) = extract_tool_update_from_step_payload(*idx, *step_type, payload) {
                 updates.push(update);
+            }
+            if *step_type == GENERATE_IMAGE_STEP_TYPE {
+                if let Some(artifact) = extract_image_artifact_from_step_payload(payload) {
+                    updates.push(message_chunk_update(
+                        "agent_message_chunk",
+                        format!("\n{}\n", image_markdown_message(&artifact.absolute_path)),
+                    ));
+                }
             }
         }
     }
